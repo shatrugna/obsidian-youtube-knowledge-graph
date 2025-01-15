@@ -1,5 +1,5 @@
 import { Plugin, TFile, Notice, MarkdownView } from 'obsidian';
-import { TAbstractFile } from 'obsidian';
+import { App, TFolder, Modal, TAbstractFile } from 'obsidian';
 import { PluginSettings, DEFAULT_SETTINGS, SettingTab } from './settings';
 import { requestUrl } from 'obsidian';
 
@@ -13,7 +13,9 @@ interface YoutubeMetadata {
     videoId: string;
     title: string;
     transcript: string;
-    themes: string[];
+    broad_themes: string[];
+    specific_themes: string[];
+    themes: string[];  // Keep this for backwards compatibility if needed
     summary: string;
 }
 
@@ -23,21 +25,77 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
     async onload() {
       await this.loadSettings();
 
+      this.addRibbonIcon('youtube', 'Add YouTube Video', (evt: MouseEvent) => {
+        console.log("YouTube icon clicked"); // Debug log
+        new YouTubeInputModal(this.app, async (url) => {
+            console.log("Modal submitted with URL:", url); // Debug log
+            const progress = new ProgressNotice('Processing YouTube video');
+            
+            try {
+                const videoId = this.extractVideoId(url);
+                if (!videoId) {
+                    throw new Error('Invalid YouTube URL');
+                }
     
+                console.log("Starting video processing sequence"); // Debug log
+                progress.setProgress(10);
+                progress.setMessage('Fetching video information');
+
+                // Get video title
+                const titleResponse = await requestUrl({
+                    url: `https://noembed.com/embed?url=https://www.youtube.com/watch?v=${videoId}`,
+                    method: 'GET'
+                });
+
+                progress.setProgress(20);
+                progress.setMessage('Processing video title');
+
+                const videoData = JSON.parse(titleResponse.text);
+                const videoTitle = videoData.title || `Untitled Video (${videoId})`;
+                const sanitizedTitle = videoTitle
+                    .replace(/[\/\\:*?"<>|]/g, '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+
+                progress.setProgress(30);
+                progress.setMessage('Creating note');
+
+                const activeFolder = this.app.vault.getAbstractFileByPath(
+                    this.app.workspace.getActiveFile()?.parent.path || "/"
+                );
+                const folderPath = activeFolder instanceof TFolder ? activeFolder.path : "/";
+                
+                const note = await this.app.vault.create(
+                    `${folderPath}/YT - ${sanitizedTitle}.md`,
+                    `# ${videoTitle}\n\nVideo Link: ${url}\n`
+                );
+
+                progress.setProgress(40);
+                progress.setMessage('Transcribing video');
+
+                // Modify processNewNote to report progress
+                await this.processNewNoteWithProgress(note, progress);
+                
+                progress.setProgress(100);
+                progress.setMessage('Complete!');
+                
+                // Open the note
+                this.app.workspace.getLeaf().openFile(note);
+
+                // Hide progress after a short delay
+                setTimeout(() => progress.hide(), 2000);
+
+            } catch (error) {
+                progress.setMessage(`Error: ${error.message}`);
+                setTimeout(() => progress.hide(), 3000);
+                console.error('Error creating note:', error);
+            }
+        }).open();
+      });
+
       // Add settings tab
       this.addSettingTab(new SettingTab(this.app, this));
 
-        
-      // Register event listener for file creation using vault events
-      this.registerEvent(
-          this.app.vault.on('create', async (file: TAbstractFile) => {
-              console.log("File create event triggered:", file.path);
-              if (file instanceof TFile && file.extension === 'md') {
-                  await this.processNewNote(file);
-              }
-          })
-      );
-  
       // Add command to manually process a note
       this.addCommand({
           id: 'process-youtube-links',
@@ -86,10 +144,6 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
         await this.saveData(this.settings);
     }
 
-    private async loadApiKey(): Promise<string | null> {
-      return this.settings.anthropicApiKey || null;
-    }
-
     private async processVideo(videoId: string): Promise<YoutubeMetadata> {
         let transcript: string = '';
         
@@ -115,8 +169,8 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
             // Format transcript
             transcript = this.formatTranscript(transcriptionResult.segments);
             console.log("Transcription complete");
-     
-            // Process with Claude
+    
+            // Process with Claude with more explicit JSON instructions
             const completion = await this.retryWithBackoff(async () => {
                 const response = await requestUrl({
                     url: 'https://api.anthropic.com/v1/messages',
@@ -131,33 +185,48 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
                         max_tokens: 4096,
                         messages: [{
                             role: "user",
-                            content: `Analyze this transcript and extract main themes and create a summary. 
-                            You must respond using only valid JSON format with no additional text.
-                            The JSON must have exactly this structure:
+                            content: `Analyze this transcript and extract themes at multiple levels. 
+                            You must respond with ONLY a valid JSON object and NOTHING else - no explanations or additional text.
+                            The JSON must exactly follow this structure:
                             {
-                                "themes": ["theme1", "theme2", ...],
-                                "summary": "summary text here"
+                                "broad_themes": ["theme1", "theme2"],
+                                "specific_themes": ["specific1", "specific2"],
+                                "summary": "summary text"
                             }
-     
+    
+                            Rules:
+                            1. The response must be parseable JSON
+                            2. Do not include any text outside the JSON object
+                            3. Keep broad_themes to 3-5 high-level topics
+                            4. Keep specific_themes to 4-7 specific concepts
+                            5. Make themes generalizable for connecting to other videos
+                            
                             Transcript: ${transcript}`
                         }]
                     })
                 });
                 return response;
             });
-     
+    
             console.log("Analysis complete");
             const analysis = JSON.parse(completion.text);
-            const content = JSON.parse(analysis.content[0].text);
-     
-            return {
-                videoId,
-                title: await this.getVideoTitle(videoId),
-                transcript,
-                themes: content.themes || [],
-                summary: content.summary || ''
-            };
-     
+            
+            try {
+                const content = JSON.parse(analysis.content[0].text);
+                return {
+                    videoId,
+                    title: await this.getVideoTitle(videoId),
+                    transcript,
+                    broad_themes: content.broad_themes || [],
+                    specific_themes: content.specific_themes || [],
+                    themes: [...(content.broad_themes || []), ...(content.specific_themes || [])],
+                    summary: content.summary || ''
+                };
+            } catch (parseError) {
+                console.error("Error parsing Claude's response:", analysis.content[0].text);
+                throw new Error("Failed to parse Claude's response as JSON");
+            }
+    
         } catch (error) {
             console.error('Error in processVideo:', error);
             new Notice(`Failed to process video: ${error.message}`);
@@ -166,11 +235,13 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
                 videoId,
                 title: await this.getVideoTitle(videoId),
                 transcript: transcript || 'Transcript unavailable',
+                broad_themes: [],
+                specific_themes: [],
                 themes: [],
                 summary: 'Processing failed: ' + error.message
             };
         }
-     }
+    }
 
      private formatTranscript(segments: WhisperTranscriptSegment[]): string {
         let formatted = '# Transcript\n\n';
@@ -310,21 +381,18 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
         try {
             const content = await this.app.vault.read(file);
             
-            // Create a themes note if it doesn't exist
-            for (const theme of metadata.themes) {
+            // Create theme notes with hierarchy
+            for (const theme of [...metadata.broad_themes, ...metadata.specific_themes]) {
                 const themeFileName = `Themes/${theme}.md`;
                 try {
-                    // Check if theme note exists
                     await this.app.vault.adapter.exists(themeFileName);
                 } catch {
-                    // Create theme note if it doesn't exist
                     await this.app.vault.create(
                         themeFileName,
-                        `# ${theme}\n\nVideos discussing this theme:\n`
+                        `# ${theme}\n\n${this.getThemeDescription(theme, metadata)}\n\nVideos discussing this theme:\n`
                     );
                 }
                 
-                // Add backlink in theme note to this video note
                 const themeNote = await this.app.vault.getAbstractFileByPath(themeFileName);
                 if (themeNote instanceof TFile) {
                     const themeContent = await this.app.vault.read(themeNote);
@@ -336,16 +404,55 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
                     }
                 }
             }
-
-            // Update original note with summary and theme links
-            const themeLinks = metadata.themes
-                .map(theme => `[[Themes/${theme}]]`)
-                .join(', ');
-
-            const updatedContent = `${content}\n\n## Summary\n${metadata.summary}\n\n## Themes\n${themeLinks}\n`;
+    
+            // Update original note with themes and summary
+            const themeLinks = {
+                broad: metadata.broad_themes.map(theme => `[[Themes/${theme}]]`).join(', '),
+                specific: metadata.specific_themes.map(theme => `[[Themes/${theme}]]`).join(', ')
+            };
+    
+            const updatedContent = `${content}\n\n## Summary\n${metadata.summary}\n\n## Themes\n### Broad Themes\n${themeLinks.broad}\n\n### Specific Themes\n${themeLinks.specific}\n`;
             await this.app.vault.modify(file, updatedContent);
         } catch (error) {
             throw new Error(`Failed to update original note: ${error.message}`);
+        }
+    }
+    
+    private getThemeDescription(theme: string, metadata: YoutubeMetadata): string {
+        // Add context about why this theme was extracted
+        const isHighLevel = metadata.broad_themes.includes(theme);
+        const level = isHighLevel ? "broad" : "specific";
+        return `${theme} is a ${level} theme that encompasses ${isHighLevel ? 
+            "overarching concepts and topics related to" : 
+            "specific ideas and discussions about"} ${theme.toLowerCase()}.`;
+    }
+
+    private async processNewNoteWithProgress(file: TFile, progress: ProgressNotice) {
+        try {
+            const content = await this.app.vault.read(file);
+            const youtubeLinks = this.extractYoutubeLinks(content);
+    
+            if (youtubeLinks.length === 0) return;
+    
+            for (const link of youtubeLinks) {
+                const videoId = this.extractVideoId(link);
+                if (!videoId) continue;
+    
+                progress.setProgress(50);
+                progress.setMessage('Getting transcript');
+                const metadata = await this.processVideo(videoId);
+                
+                progress.setProgress(70);
+                progress.setMessage('Creating transcript note');
+                await this.createTranscriptNote(file, videoId, metadata.transcript);
+                
+                progress.setProgress(90);
+                progress.setMessage('Updating notes with analysis');
+                await this.updateOriginalNote(file, metadata);
+            }
+        } catch (error) {
+            console.error('Error processing note:', error);
+            throw error;
         }
     }
 
@@ -388,4 +495,143 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
           new Notice('No active markdown file');
       }
   }
+}
+
+class YouTubeInputModal extends Modal {
+    private url: string;
+    private onSubmit: (url: string) => void;
+
+    constructor(app: App, onSubmit: (url: string) => void) {
+        super(app);
+        this.onSubmit = onSubmit;
+    }
+
+    onOpen() {
+        const {contentEl} = this;
+
+        contentEl.createEl("h2", {text: "Add YouTube Video for Analysis"});
+
+        // URL input
+        const urlInput = contentEl.createEl("input", {
+            type: "text",
+            attr: {
+                placeholder: "Paste YouTube URL here...",
+                style: "width: 100%; padding: 5px; margin-bottom: 10px;"
+            }
+        });
+
+        // Submit button
+        const submitBtn = contentEl.createEl("button", {
+            text: "Analyze Video",
+            attr: {
+                style: "padding: 5px 10px; margin-right: 10px;"
+            }
+        });
+        submitBtn.addEventListener("click", () => {
+            this.onSubmit(urlInput.value);
+            this.close();
+        });
+
+        // Cancel button
+        const cancelBtn = contentEl.createEl("button", {
+            text: "Cancel",
+            attr: {
+                style: "padding: 5px 10px;"
+            }
+        });
+        cancelBtn.addEventListener("click", () => this.close());
+    }
+
+    onClose() {
+        const {contentEl} = this;
+        contentEl.empty();
+    }
+}
+
+class ProgressNotice {
+    private container: HTMLElement;
+    private messageEl: HTMLElement;
+    private progressBar: HTMLElement;
+    private progress: number;
+
+    constructor(message: string) {
+        console.log("Creating progress notice with message:", message); // Debug log
+        this.progress = 0;
+        this.createContainer(message);
+    }
+
+    private createContainer(message: string) {
+        console.log("Setting up progress container"); // Debug log
+        
+        // Remove existing if any
+        const existing = document.querySelector('.progress-notice');
+        if (existing) {
+            console.log("Removing existing progress notice"); // Debug log
+            existing.remove();
+        }
+
+        // Create new container
+        this.container = document.createElement('div');
+        this.container.className = 'progress-notice';
+        this.container.style.cssText = `
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background-color: var(--background-primary);
+            border: 1px solid var(--background-modifier-border);
+            border-radius: 8px;
+            padding: 15px;
+            z-index: 1000;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+            width: 300px;
+        `;
+
+        // Message element
+        this.messageEl = document.createElement('div');
+        this.messageEl.textContent = message;
+        this.container.appendChild(this.messageEl);
+
+        // Progress bar container
+        const progressContainer = document.createElement('div');
+        progressContainer.style.cssText = `
+            width: 100%;
+            background-color: var(--background-modifier-border);
+            height: 8px;
+            border-radius: 4px;
+            margin-top: 8px;
+        `;
+
+        // Progress bar
+        this.progressBar = document.createElement('div');
+        this.progressBar.style.cssText = `
+            height: 100%;
+            background-color: var(--interactive-accent);
+            border-radius: 4px;
+            transition: width 0.3s ease;
+            width: 0%;
+        `;
+        progressContainer.appendChild(this.progressBar);
+
+        this.container.appendChild(progressContainer);
+        document.body.appendChild(this.container);
+        console.log("Progress container created and added to document"); // Debug log
+    }
+
+    setProgress(progress: number) {
+        console.log("Setting progress to:", progress); // Debug log
+        this.progress = Math.min(100, Math.max(0, progress));
+        this.progressBar.style.width = `${this.progress}%`;
+    }
+
+    setMessage(message: string) {
+        console.log("Updating message to:", message); // Debug log
+        this.messageEl.textContent = message;
+    }
+
+    hide() {
+        console.log("Hiding progress notice"); // Debug log
+        if (this.container && this.container.parentNode) {
+            this.container.parentNode.removeChild(this.container);
+        }
+    }
 }

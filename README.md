@@ -4,7 +4,6 @@ A plugin for Obsidian that creates a knowledge graph from YouTube video content.
 
 ## Features
 
-- Automatically detects YouTube links in notes
 - Server-side extraction and transcription of YouTube audio using yt-dlp and Whisper
 - Uses Claude AI to analyze content and extract key themes
 - Creates theme-based connections between videos
@@ -50,14 +49,13 @@ python whisper_server.py
 
 ## Usage
 
-1. Create a new note with a YouTube video link
+1. Click on the Youtube icon in the ribbon and trigger the analysis
+   - It will create a note title "YT - {detected video title string}"
 
-2. Run "Process YouTube Links in Current Note" from the command palette
-
-3. The plugin will:
+2. The plugin will:
    - Extract and transcribe the video using the local Whisper server
-   - Create a raw transcript note titled "Raw Transcript - {original note name}"
-   - Extract themes and create a summary using Claude
+   - Create a raw transcript note titled "YT - {detected video title string} - Transcript"
+   - Extract themes (both broad and specific) and create a summary using Claude
    - Create theme notes in a Themes/ folder
    - Update the original note with themes and summary
    - Link everything together in Obsidian's graph
@@ -97,7 +95,6 @@ npm run build
 - Implement batch processing for multiple videos
 - Add more theme analysis options
 - Add configuration for Whisper model selection
-- Add progress indicators for long transcriptions
 - Support for different YouTube URL formats
 
 ## Support

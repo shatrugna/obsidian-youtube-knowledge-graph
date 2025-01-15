@@ -7,10 +7,6 @@
 		"dev": "rollup --config rollup.config.js -w",
 		"build": "rollup --config rollup.config.js --environment BUILD:production"
 	},
-	"dependencies": {
-		"openai": "^4.0.0",
-		"youtube-transcript": "^1.2.1"
-	},
 	"devDependencies": {
 		"@rollup/plugin-commonjs": "^21.0.1",
 		"@rollup/plugin-json": "^4.1.0",
@@ -19,6 +15,7 @@
 		"@types/node": "^16.11.6",
 		"obsidian": "^0.15.0",
 		"rollup": "^2.67.2",
+		"rollup-plugin-copy": "^3.5.0",
 		"tslib": "^2.3.1",
 		"typescript": "^4.5.5"
 	}

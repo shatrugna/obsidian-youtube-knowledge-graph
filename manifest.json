@@ -3,8 +3,7 @@
     "name": "YouTube Knowledge Graph",
     "version": "1.0.0",
     "minAppVersion": "0.15.0",
-    "description": "Creates knowledge graphs from YouTube video transcripts",
-    "author": "ssadhu",
-    "isDesktopOnly": false,
-    "css": "styles.css"
+    "description": "Creates knowledge graphs from YouTube videos using Whisper and Claude",
+    "author": "Your Name",
+    "isDesktopOnly": false
 }

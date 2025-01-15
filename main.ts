@@ -1,8 +1,13 @@
 import { Plugin, TFile, Notice, MarkdownView } from 'obsidian';
-import { Events, TAbstractFile } from 'obsidian';
-import { YoutubeTranscript } from 'youtube-transcript';
+import { TAbstractFile } from 'obsidian';
 import { PluginSettings, DEFAULT_SETTINGS, SettingTab } from './settings';
 import { requestUrl } from 'obsidian';
+
+interface WhisperTranscriptSegment {
+    start: number;
+    end: number;
+    text: string;
+}
 
 interface YoutubeMetadata {
     videoId: string;
@@ -17,10 +22,12 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
 
     async onload() {
       await this.loadSettings();
-  
+
+    
       // Add settings tab
       this.addSettingTab(new SettingTab(this.app, this));
-  
+
+        
       // Register event listener for file creation using vault events
       this.registerEvent(
           this.app.vault.on('create', async (file: TAbstractFile) => {
@@ -83,6 +90,109 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
       return this.settings.anthropicApiKey || null;
     }
 
+    private async processVideo(videoId: string): Promise<YoutubeMetadata> {
+        let transcript: string = '';
+        
+        try {
+            console.log("Starting to process video:", videoId);
+            
+            if (!this.settings.anthropicApiKey) {
+                throw new Error('Anthropic API key not set');
+            }
+    
+            // Get transcript directly from our Python server
+            const response = await requestUrl({
+                url: `http://localhost:8000/transcribe/${videoId}`,
+                method: 'POST'
+            });
+    
+            if (response.status !== 200) {
+                throw new Error(`Failed to transcribe: ${response.text}`);
+            }
+    
+            const transcriptionResult = JSON.parse(response.text);
+            
+            // Format transcript
+            transcript = this.formatTranscript(transcriptionResult.segments);
+            console.log("Transcription complete");
+     
+            // Process with Claude
+            const completion = await this.retryWithBackoff(async () => {
+                const response = await requestUrl({
+                    url: 'https://api.anthropic.com/v1/messages',
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': this.settings.anthropicApiKey,
+                        'anthropic-version': '2023-06-01'
+                    },
+                    body: JSON.stringify({
+                        model: "claude-3-opus-20240229",
+                        max_tokens: 4096,
+                        messages: [{
+                            role: "user",
+                            content: `Analyze this transcript and extract main themes and create a summary. 
+                            You must respond using only valid JSON format with no additional text.
+                            The JSON must have exactly this structure:
+                            {
+                                "themes": ["theme1", "theme2", ...],
+                                "summary": "summary text here"
+                            }
+     
+                            Transcript: ${transcript}`
+                        }]
+                    })
+                });
+                return response;
+            });
+     
+            console.log("Analysis complete");
+            const analysis = JSON.parse(completion.text);
+            const content = JSON.parse(analysis.content[0].text);
+     
+            return {
+                videoId,
+                title: await this.getVideoTitle(videoId),
+                transcript,
+                themes: content.themes || [],
+                summary: content.summary || ''
+            };
+     
+        } catch (error) {
+            console.error('Error in processVideo:', error);
+            new Notice(`Failed to process video: ${error.message}`);
+            
+            return {
+                videoId,
+                title: await this.getVideoTitle(videoId),
+                transcript: transcript || 'Transcript unavailable',
+                themes: [],
+                summary: 'Processing failed: ' + error.message
+            };
+        }
+     }
+
+     private formatTranscript(segments: WhisperTranscriptSegment[]): string {
+        let formatted = '# Transcript\n\n';
+        
+        console.log("Formatting segments:", segments); // Debug log
+    
+        segments.forEach(segment => {
+            const startTime = this.formatTimestamp(segment.start);
+            const endTime = this.formatTimestamp(segment.end);
+            formatted += `[${startTime} - ${endTime}] ${segment.text}\n\n`;
+        });
+    
+        console.log("Formatted transcript length:", formatted.length); // Debug log
+        return formatted;
+    }
+    
+    private formatTimestamp(seconds: number): string {
+        const minutes = Math.floor(seconds / 60);
+        const remainingSeconds = Math.floor(seconds % 60);
+        return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+    }
+
     private async getVideoTitle(videoId: string): Promise<string> {
         try {
             const response = await fetch(`https://noembed.com/embed?url=https://www.youtube.com/watch?v=${videoId}`);
@@ -114,18 +224,29 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
         return match ? match[1] : null;
     }
 
-    private async createTranscriptNote(originalFile: TFile, videoId: string): Promise<TFile> {
-        const transcriptFileName = `${originalFile.basename} - Transcript`;
-        const transcriptFilePath = `${originalFile.parent.path}/${transcriptFileName}.md`;
-        
+    private async createTranscriptNote(originalFile: TFile, videoId: string, transcriptContent: string): Promise<TFile> {
         try {
-            // Create new note for transcript
-            const file = await this.app.vault.create(
-                transcriptFilePath,
-                `Transcript for video: ${videoId}\n\n`
-            );
-            return file;
+            const transcriptFileName = `${originalFile.basename} - Transcript`;
+            const transcriptFilePath = `${originalFile.parent.path}/${transcriptFileName}.md`;
+            
+            console.log("Creating transcript note at:", transcriptFilePath); // Debug log
+            console.log("With content length:", transcriptContent.length); // Debug log
+            
+            // Create content with timestamp formatting
+            const content = `# Transcript for ${originalFile.basename}\n\n${transcriptContent}`;
+            
+            // Create or update transcript note
+            const existingFile = this.app.vault.getAbstractFileByPath(transcriptFilePath);
+            if (existingFile instanceof TFile) {
+                console.log("Updating existing transcript file");
+                await this.app.vault.modify(existingFile, content);
+                return existingFile;
+            } else {
+                console.log("Creating new transcript file");
+                return await this.app.vault.create(transcriptFilePath, content);
+            }
         } catch (error) {
+            console.error('Error creating transcript note:', error);
             throw new Error(`Failed to create transcript note: ${error.message}`);
         }
     }
@@ -160,114 +281,6 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
           throw error;
       }
     }
-
-    private async fetchTranscript(videoId: string): Promise<string> {
-      try {
-          console.log("Attempting to fetch transcript for video:", videoId);
-          
-          // List of Piped instances to try
-          const pipedInstances = [
-              'https://pipedapi.kavin.rocks',
-              'https://api.piped.projectsegfau.lt',
-              'https://pipedapi.aeong.one',
-              'https://piped-api.garudalinux.org'
-          ];
-  
-          for (const instance of pipedInstances) {
-              try {
-                  console.log(`Trying Piped instance: ${instance}`);
-                  const pipedResponse = await requestUrl({
-                      url: `${instance}/streams/${videoId}`,
-                      method: 'GET',
-                      headers: {
-                          'Accept': 'application/json'
-                      },
-                      throw: false
-                  });
-  
-                  console.log(`Response status from ${instance}:`, pipedResponse.status);
-  
-                  if (pipedResponse.status === 200) {
-                      const videoData = JSON.parse(pipedResponse.text);
-                      
-                      // If we have subtitles/captions
-                      if (videoData.subtitles && videoData.subtitles.length > 0) {
-                          // Try to get English subtitles first
-                          const englishSub = videoData.subtitles.find((sub: any) => 
-                              sub.url && (sub.code === 'en' || sub.code.startsWith('en'))
-                          );
-                          
-                          if (englishSub) {
-                              const subtitleResponse = await requestUrl({
-                                  url: englishSub.url,
-                                  method: 'GET',
-                                  throw: false
-                              });
-                              
-                              if (subtitleResponse.status === 200) {
-                                  return subtitleResponse.text;
-                              }
-                          }
-                      }
-  
-                      // If no subtitles, fall back to video description
-                      if (videoData.description) {
-                          const title = videoData.title || 'Video Title';
-                          return `Title: ${title}\n\nDescription: ${videoData.description}`;
-                      }
-  
-                      // If this instance worked but had no content, try next instance
-                      continue;
-                  }
-              } catch (instanceError) {
-                  console.log(`Error with instance ${instance}:`, instanceError);
-                  // Continue to next instance
-                  continue;
-              }
-          }
-  
-          // If all automated methods fail, check for manual transcript
-          const manualTranscriptFile = this.app.vault.getAbstractFileByPath(`${videoId}-manual-transcript.md`);
-          
-          if (manualTranscriptFile instanceof TFile) {
-              // If manual transcript exists, read it
-              const content = await this.app.vault.read(manualTranscriptFile);
-              
-              // Extract the content after the separator line
-              const separator = '---\n\n';
-              const transcriptContent = content.split(separator)[1];
-              
-              if (transcriptContent && transcriptContent.trim().length > 0) {
-                  return transcriptContent.trim();
-              }
-          }
-
-          // If no manual transcript exists or it's empty, prompt for manual input
-          return await this.promptForManualTranscript(videoId);
-
-        } catch (error) {
-          console.error('Detailed transcript fetch error:', error);
-          return await this.promptForManualTranscript(videoId);
-        }
-    }
-  
-    private processInvidiousResponse(responseText: string): string {
-      try {
-          const data = JSON.parse(responseText);
-          if (Array.isArray(data) && data.length > 0) {
-              // Find English captions or take the first available
-              const englishCaptions = data.find((cap: any) => cap.language_code.startsWith('en')) || data[0];
-              
-              if (englishCaptions && englishCaptions.label) {
-                  return `Language: ${englishCaptions.label}\n${englishCaptions.text || ''}`;
-              }
-          }
-          return 'No captions found in the response';
-      } catch (error) {
-          console.error('Error processing Invidious response:', error);
-          return 'Error processing video captions';
-      }
-    }
   
     // Add this helper function at class level
     private async retryWithBackoff<T>(
@@ -291,121 +304,6 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
           }
       }
       throw lastError;
-    }
-
-    private async processVideo(videoId: string): Promise<YoutubeMetadata> {
-      let transcript: string = '';
-      
-      try {
-          console.log("Starting to process video:", videoId);
-          
-          if (!this.settings.anthropicApiKey) {
-              throw new Error('Anthropic API key not set');
-          }
-  
-          transcript = await this.fetchTranscript(videoId);
-          console.log("Got content to analyze, length:", transcript.length);
-  
-          // Wrap the Claude API call in retry logic
-          const completion = await this.retryWithBackoff(async () => {
-              const requestBody = {
-                model: "claude-3-opus-20240229",
-                max_tokens: 4096,  // Added this required field
-                messages: [{
-                    role: "user",
-                    content: `Analyze this transcript and extract main themes and create a summary. 
-                              You must respond using only valid JSON format with no additional text.
-                              The JSON must have exactly this structure:
-                              {
-                                  "themes": ["theme1", "theme2", ...],
-                                  "summary": "summary text here"
-                              }
-            
-                              Transcript: ${transcript}`
-                }]
-              };
-  
-              console.log("Making Claude API request with body:", JSON.stringify(requestBody, null, 2));
-  
-              const response = await requestUrl({
-                url: 'https://api.anthropic.com/v1/messages',
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-api-key': this.settings.anthropicApiKey,
-                    'anthropic-version': '2023-06-01'  // Changed from '2024-01-01' to '2023-06-01'
-                },
-                body: JSON.stringify(requestBody),
-                throw: false
-              });
-  
-              // Log everything about the response
-              console.log({
-                status: response.status,
-                statusText: response.status,
-                headers: response.headers,
-                text: response.text,
-              });
-            
-              if (response.status !== 200) {
-                console.error("Full response:", response);
-                console.error("Response text:", response.text);
-                console.error("Response headers:", response.headers);
-                throw new Error(`Claude API returned status ${response.status}: ${response.text}`);
-              }
-  
-              return response;
-          });
-  
-          console.log("Claude response received:", completion.text.substring(0, 200)); // Log first 200 chars
-          const analysis = JSON.parse(completion.text);
-  
-          let themes: string[] = [];
-          let summary: string = '';
-  
-          try {
-            const content = analysis.content[0].text;
-            // Try to extract JSON if it's embedded in other text
-            const jsonMatch = content.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-                const jsonStr = jsonMatch[0];
-                const parsedContent = JSON.parse(jsonStr);
-                themes = parsedContent.themes || [];
-                summary = parsedContent.summary || '';
-            } else {
-                console.error('No JSON found in response:', content);
-                // Fallback: treat the entire response as a summary
-                summary = content;
-                themes = ['Theme extraction failed'];
-            }
-          } catch (parseError) {
-              console.error('Error parsing Claude response:', parseError);
-              // Fallback to raw content if JSON parsing fails
-              const rawContent = analysis.content[0].text;
-              summary = rawContent;
-              themes = ['Theme parsing failed'];
-          }
-  
-          return {
-              videoId,
-              title: await this.getVideoTitle(videoId),
-              transcript,
-              themes,
-              summary
-          };
-  
-      } catch (error) {
-          console.error('Error in processVideo:', error);
-          new Notice(`Failed to process video: ${error.message}`);
-          
-          return {
-              videoId,
-              title: await this.getVideoTitle(videoId),
-              transcript: transcript || 'Transcript unavailable',
-              themes: [],
-              summary: 'Processing failed: ' + error.message
-          };
-      }
     }
 
     private async updateOriginalNote(file: TFile, metadata: YoutubeMetadata) {
@@ -453,34 +351,30 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
 
     private async processNewNote(file: TFile) {
         try {
-            console.log("Processing new note:", file.path);
             const content = await this.app.vault.read(file);
-            console.log("Found content:", content);
-
             const youtubeLinks = this.extractYoutubeLinks(content);
-            console.log("Found YouTube links:", youtubeLinks);
-
-            if (youtubeLinks.length === 0) {
-              console.log("No YouTube links found");
-              return;
-            }
-
+    
+            if (youtubeLinks.length === 0) return;
+    
             for (const link of youtubeLinks) {
                 const videoId = this.extractVideoId(link);
                 if (!videoId) continue;
-
-                // Create scratch note for transcript
-                const transcriptNote = await this.createTranscriptNote(file, videoId);
-                
-                // Process video content
+    
+                // Process video and get metadata
                 const metadata = await this.processVideo(videoId);
+                
+                console.log("Got metadata with transcript length:", metadata.transcript.length); // Debug log
+                
+                // Create transcript note with the actual transcript
+                console.log("Creating transcript note with content:", metadata.transcript.substring(0, 200)); // Debug first 200 chars
+                await this.createTranscriptNote(file, videoId, metadata.transcript);
                 
                 // Update original note with summary and themes
                 await this.updateOriginalNote(file, metadata);
             }
         } catch (error) {
-            new Notice(`Error processing note: ${error.message}`);
             console.error('Error processing note:', error);
+            new Notice(`Error processing note: ${error.message}`);
         }
     }
 

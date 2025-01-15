@@ -20,3 +20,8 @@ data.json
 
 # Exclude macOS Finder (System Explorer) View States
 .DS_Store
+
+# Python
+whisper_env/
+__pycache__/
+*.pyc

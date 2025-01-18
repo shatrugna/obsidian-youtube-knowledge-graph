@@ -17,13 +17,25 @@ interface YoutubeMetadata {
     specific_themes: string[];
     themes: string[];  // Keep this for backwards compatibility if needed
     summary: string;
+    segments: WhisperTranscriptSegment[];
+}
+
+interface EmbeddingMetadata {
+    text: string;
+    embedding: number[];
+    filePath: string;
+    timestamp?: number;  // For video content
 }
 
 export default class YoutubeKnowledgeGraphPlugin extends Plugin {
     settings: PluginSettings;
+    private vectorStore: ObsidianVectorStore;
+    private currentFile: TFile | null = null;  // Add this property
 
     async onload() {
       await this.loadSettings();
+
+      this.vectorStore = new ObsidianVectorStore(this);
 
       this.addRibbonIcon('youtube', 'Add YouTube Video', (evt: MouseEvent) => {
         console.log("YouTube icon clicked"); // Debug log
@@ -104,6 +116,25 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
       });
 
       this.addCommand({
+        id: 'inspect-vectors',
+        name: 'Debug: Inspect Vector Store',
+        callback: () => {
+            console.log("Current embeddings in store:", this.vectorStore.embeddings.length);
+            console.log("Sample similarities between notes:");
+            
+            if (this.vectorStore.embeddings.length > 1) {
+                const first = this.vectorStore.embeddings[0];
+                const similar = this.vectorStore.findSimilar(first.embedding, 0.5);
+                console.log("Similar content to first chunk:", similar.map(s => ({
+                    file: s.filePath,
+                    similarity: s.similarity,
+                    snippet: s.text.substring(0, 100)
+                })));
+            }
+        }
+      });
+
+      this.addCommand({
         id: 'manual-transcript-input',
         name: 'Input Manual Transcript',
         callback: async () => {
@@ -134,6 +165,20 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
         name: 'Test Process Current Note',
         callback: () => this.testProcessCurrentNote()
       });
+
+      this.addCommand({
+        id: 'cleanup-transcripts',
+        name: 'Clean up transcript folder',
+        callback: async () => {
+            try {
+                await this.app.vault.adapter.rmdir('.transcripts', true);
+                new Notice('Transcripts folder cleaned up');
+            } catch (error) {
+                console.error('Failed to clean up transcripts:', error);
+                new Notice('Failed to clean up transcripts folder');
+            }
+        }
+      });
     }
 
     async loadSettings() {
@@ -144,8 +189,128 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
         await this.saveData(this.settings);
     }
 
+    private async getEmbedding(text: string): Promise<number[]> {
+        try {
+            const response = await requestUrl({
+                url: 'https://api.anthropic.com/v1/messages',
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-key': this.settings.anthropicApiKey,
+                    'anthropic-version': '2023-06-01'
+                },
+                body: JSON.stringify({
+                    model: "claude-3-opus-20240229",
+                    max_tokens: 2048,
+                    messages: [{
+                        role: "user",
+                        content: `Create a 64-dimensional vector representation of this text for semantic similarity comparison.
+                        Return ONLY a JSON array of EXACTLY 64 numbers between -1 and 1.
+                        Each number should be rounded to 4 decimal places.
+                        The array must be complete and properly closed.
+                        
+                        Example format: [-0.1234, 0.4567, ..., 0.7890] (with exactly 64 numbers)
+                        
+                        Text: "${text.substring(0, 500)}"`
+                    }]
+                })
+            });
+    
+            const result = JSON.parse(response.text);
+            
+            // Log the raw response for debugging
+            console.log("Raw Claude embedding response:", result.content[0].text);
+    
+            // Clean up the response text
+            let cleanedText = result.content[0].text
+                .trim()
+                .replace(/^```json\s*/, '')
+                .replace(/\s*```$/, '')
+                .replace(/[\n\r]/g, '');
+    
+            try {
+                const embedding = JSON.parse(cleanedText);
+    
+                // Validate embedding format
+                if (!Array.isArray(embedding)) {
+                    throw new Error('Response is not an array');
+                }
+    
+                if (embedding.length !== 64) {
+                    throw new Error(`Embedding must be exactly 64 dimensions, got ${embedding.length}`);
+                }
+    
+                if (!embedding.every(num => typeof num === 'number' && !isNaN(num))) {
+                    throw new Error('Array contains non-numeric values');
+                }
+    
+                return embedding;
+    
+            } catch (parseError) {
+                console.error('Error parsing embedding:', parseError);
+                console.error('Cleaned text:', cleanedText);
+                throw new Error(`Failed to parse embedding array: ${parseError.message}`);
+            }
+    
+        } catch (error) {
+            console.error('Failed to get embedding:', error);
+            throw error;
+        }
+    }
+
+    private createChunks(segments: WhisperTranscriptSegment[], maxChunkSize: number): {
+        text: string;
+        startTime: number;
+    }[] {
+        const chunks: { text: string; startTime: number; }[] = [];
+        let currentChunk = '';
+        let currentStartTime = segments[0]?.start || 0;
+    
+        for (const segment of segments) {
+            // If adding this segment would exceed maxChunkSize, save current chunk and start new one
+            if (currentChunk.length + segment.text.length > maxChunkSize && currentChunk.length > 0) {
+                chunks.push({
+                    text: currentChunk.trim(),
+                    startTime: currentStartTime
+                });
+                currentChunk = '';
+                currentStartTime = segment.start;
+            }
+    
+            currentChunk += ' ' + segment.text;
+        }
+    
+        // Don't forget to add the last chunk if it has content
+        if (currentChunk.trim().length > 0) {
+            chunks.push({
+                text: currentChunk.trim(),
+                startTime: currentStartTime
+            });
+        }
+    
+        return chunks;
+    }
+
+    private async processTranscriptChunks(transcript: string, segments: WhisperTranscriptSegment[], file: TFile): Promise<EmbeddingMetadata[]> {
+        const chunks = this.createChunks(segments, 1000);
+    
+        const embeddings: EmbeddingMetadata[] = [];
+        for (const chunk of chunks) {
+            const embedding = await this.getEmbedding(chunk.text);
+            embeddings.push({
+                text: chunk.text,
+                embedding: embedding,
+                filePath: file.path,
+                timestamp: chunk.startTime
+            });
+        }
+    
+        return embeddings;
+    }
+
     private async processVideo(videoId: string): Promise<YoutubeMetadata> {
         let transcript: string = '';
+        let segments: WhisperTranscriptSegment[] = [];
         
         try {
             console.log("Starting to process video:", videoId);
@@ -154,7 +319,7 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
                 throw new Error('Anthropic API key not set');
             }
     
-            // Get transcript directly from our Python server
+            // Get transcript from Whisper server
             const response = await requestUrl({
                 url: `http://localhost:8000/transcribe/${videoId}`,
                 method: 'POST'
@@ -165,13 +330,13 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
             }
     
             const transcriptionResult = JSON.parse(response.text);
-            
-            // Format transcript
-            transcript = this.formatTranscript(transcriptionResult.segments);
+            segments = transcriptionResult.segments;
+            transcript = this.formatTranscript(segments);
             console.log("Transcription complete");
     
-            // Process with Claude with more explicit JSON instructions
+            // Process with Claude
             const completion = await this.retryWithBackoff(async () => {
+                console.log("Sending transcript to Claude for analysis...");
                 const response = await requestUrl({
                     url: 'https://api.anthropic.com/v1/messages',
                     method: 'POST',
@@ -185,47 +350,62 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
                         max_tokens: 4096,
                         messages: [{
                             role: "user",
-                            content: `Analyze this transcript and extract themes at multiple levels. 
-                            You must respond with ONLY a valid JSON object and NOTHING else - no explanations or additional text.
-                            The JSON must exactly follow this structure:
+                            content: `Analyze this transcript and extract themes at multiple levels.
+                            You must respond with ONLY a valid JSON object - no other text, no explanations, no markdown.
+                            The response must be parseable by JSON.parse().
+                            
+                            Required JSON structure:
                             {
                                 "broad_themes": ["theme1", "theme2"],
                                 "specific_themes": ["specific1", "specific2"],
                                 "summary": "summary text"
                             }
     
-                            Rules:
-                            1. The response must be parseable JSON
-                            2. Do not include any text outside the JSON object
-                            3. Keep broad_themes to 3-5 high-level topics
-                            4. Keep specific_themes to 4-7 specific concepts
-                            5. Make themes generalizable for connecting to other videos
+                            Guidelines:
+                            1. strict JSON format only
+                            2. no comments or additional text
+                            3. use double quotes for strings
+                            4. broad_themes: 3-5 high-level topics
+                            5. specific_themes: 4-7 specific concepts
                             
-                            Transcript: ${transcript}`
+                            Transcript content:
+                            ${transcript}`
                         }]
                     })
                 });
+                console.log("Got Claude response:", response.text);
                 return response;
             });
     
-            console.log("Analysis complete");
+            console.log("Parsing Claude response...");
             const analysis = JSON.parse(completion.text);
+            console.log("Analysis object:", analysis);
             
-            try {
-                const content = JSON.parse(analysis.content[0].text);
-                return {
-                    videoId,
-                    title: await this.getVideoTitle(videoId),
-                    transcript,
-                    broad_themes: content.broad_themes || [],
-                    specific_themes: content.specific_themes || [],
-                    themes: [...(content.broad_themes || []), ...(content.specific_themes || [])],
-                    summary: content.summary || ''
-                };
-            } catch (parseError) {
-                console.error("Error parsing Claude's response:", analysis.content[0].text);
-                throw new Error("Failed to parse Claude's response as JSON");
+            if (!analysis.content || !analysis.content[0] || !analysis.content[0].text) {
+                throw new Error("Invalid response structure from Claude");
             }
+    
+            console.log("Parsing content text:", analysis.content[0].text);
+            const content = JSON.parse(analysis.content[0].text);
+            console.log("Parsed content:", content);
+    
+            if (!content.broad_themes || !content.specific_themes || !content.summary) {
+                throw new Error("Missing required fields in Claude's response");
+            }
+    
+            const metadata: YoutubeMetadata = {
+                videoId,
+                title: await this.getVideoTitle(videoId),
+                transcript,
+                broad_themes: content.broad_themes,
+                specific_themes: content.specific_themes,
+                themes: [...content.broad_themes, ...content.specific_themes],
+                summary: content.summary,
+                segments
+            };
+    
+            console.log("Created metadata:", metadata);
+            return metadata;
     
         } catch (error) {
             console.error('Error in processVideo:', error);
@@ -238,7 +418,8 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
                 broad_themes: [],
                 specific_themes: [],
                 themes: [],
-                summary: 'Processing failed: ' + error.message
+                summary: 'Processing failed: ' + error.message,
+                segments: []
             };
         }
     }
@@ -297,23 +478,25 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
 
     private async createTranscriptNote(originalFile: TFile, videoId: string, transcriptContent: string): Promise<TFile> {
         try {
-            const transcriptFileName = `${originalFile.basename} - Transcript`;
-            const transcriptFilePath = `${originalFile.parent.path}/${transcriptFileName}.md`;
+            // Use a hidden folder for transcripts
+            const transcriptFolderPath = '.transcripts';
+            const transcriptFileName = `Raw Transcript - ${originalFile.basename}`;
+            const transcriptFilePath = `${transcriptFolderPath}/${transcriptFileName}.md`;
             
-            console.log("Creating transcript note at:", transcriptFilePath); // Debug log
-            console.log("With content length:", transcriptContent.length); // Debug log
-            
-            // Create content with timestamp formatting
+            // Create transcripts folder if it doesn't exist
+            if (!await this.app.vault.adapter.exists(transcriptFolderPath)) {
+                await this.app.vault.createFolder(transcriptFolderPath);
+            }
+    
+            // Create content
             const content = `# Transcript for ${originalFile.basename}\n\n${transcriptContent}`;
             
             // Create or update transcript note
             const existingFile = this.app.vault.getAbstractFileByPath(transcriptFilePath);
             if (existingFile instanceof TFile) {
-                console.log("Updating existing transcript file");
                 await this.app.vault.modify(existingFile, content);
                 return existingFile;
             } else {
-                console.log("Creating new transcript file");
                 return await this.app.vault.create(transcriptFilePath, content);
             }
         } catch (error) {
@@ -377,19 +560,20 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
       throw lastError;
     }
 
-    private async updateOriginalNote(file: TFile, metadata: YoutubeMetadata) {
+    private async _updateOriginalNote(file: TFile, metadata: YoutubeMetadata) {
         try {
+            // First read the existing content
             const content = await this.app.vault.read(file);
             
-            // Create theme notes with hierarchy
-            for (const theme of [...metadata.broad_themes, ...metadata.specific_themes]) {
+            // Create theme notes
+            for (const theme of metadata.themes) {
                 const themeFileName = `Themes/${theme}.md`;
                 try {
                     await this.app.vault.adapter.exists(themeFileName);
                 } catch {
                     await this.app.vault.create(
                         themeFileName,
-                        `# ${theme}\n\n${this.getThemeDescription(theme, metadata)}\n\nVideos discussing this theme:\n`
+                        `# ${theme}\n\nVideos discussing this theme:\n`
                     );
                 }
                 
@@ -405,26 +589,88 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
                 }
             }
     
-            // Update original note with themes and summary
-            const themeLinks = {
-                broad: metadata.broad_themes.map(theme => `[[Themes/${theme}]]`).join(', '),
-                specific: metadata.specific_themes.map(theme => `[[Themes/${theme}]]`).join(', ')
-            };
+            // Update original note with summary and separated theme links
+            const broadThemeLinks = metadata.broad_themes
+                .map(theme => `[[Themes/${theme}]]`)
+                .join(', ');
+                
+            const specificThemeLinks = metadata.specific_themes
+                .map(theme => `[[Themes/${theme}]]`)
+                .join(', ');
+            
+            // Create the updated content with summary and themes
+            const updatedContent = `${content}
     
-            const updatedContent = `${content}\n\n## Summary\n${metadata.summary}\n\n## Themes\n### Broad Themes\n${themeLinks.broad}\n\n### Specific Themes\n${themeLinks.specific}\n`;
+    ## Summary
+    ${metadata.summary}
+    
+    ## Themes
+    ### Broad Themes
+    ${broadThemeLinks}
+    
+    ### Specific Themes
+    ${specificThemeLinks}
+    `;
+    
+            // Write the updated content back to the file
             await this.app.vault.modify(file, updatedContent);
+            console.log("Note updated successfully with themes and summary");
+    
         } catch (error) {
+            console.error('Error updating note:', error);
             throw new Error(`Failed to update original note: ${error.message}`);
         }
     }
+
+    private async updateOriginalNote(file: TFile, metadata: YoutubeMetadata) {
+        console.log("Processing chunks for semantic matching...");
+        const chunks = await this.processTranscriptChunks(metadata.transcript, metadata.segments, file);
+        console.log(`Generated ${chunks.length} chunks`);
     
-    private getThemeDescription(theme: string, metadata: YoutubeMetadata): string {
-        // Add context about why this theme was extracted
-        const isHighLevel = metadata.broad_themes.includes(theme);
-        const level = isHighLevel ? "broad" : "specific";
-        return `${theme} is a ${level} theme that encompasses ${isHighLevel ? 
-            "overarching concepts and topics related to" : 
-            "specific ideas and discussions about"} ${theme.toLowerCase()}.`;
+        const connections = new Map<string, {similarity: number, snippets: string[]}>();
+        
+        console.log("Finding semantic connections...");
+        for (const chunk of chunks) {
+            const similar = this.vectorStore.findSimilar(chunk.embedding, 0.8);
+            console.log(`Found ${similar.length} similar chunks for current segment`);
+            
+            for (const match of similar) {
+                if (match.filePath === file.path) continue;
+                
+                console.log(`Match found in ${match.filePath} with similarity ${match.similarity}`);
+                console.log(`Matching text: "${match.text.substring(0, 100)}..."`);
+                
+                const existing = connections.get(match.filePath) || {
+                    similarity: 0,
+                    snippets: []
+                };
+                
+                existing.similarity = Math.max(existing.similarity, match.similarity);
+                existing.snippets.push(match.text);
+                connections.set(match.filePath, existing);
+            }
+        }
+    
+        console.log(`Found connections to ${connections.size} other notes`);
+        
+        // Update note with connections
+        let content = await this.app.vault.read(file);
+        content += '\n\n## Related Content\n';
+        
+        for (const [path, data] of connections) {
+            const relatedFile = this.app.vault.getAbstractFileByPath(path);
+            if (relatedFile instanceof TFile) {
+                console.log(`Adding connection to ${relatedFile.basename} (${data.similarity})`);
+                content += `\n### [[${relatedFile.basename}]] (${(data.similarity * 100).toFixed(1)}% similar)\n`;
+                content += data.snippets
+                    .slice(0, 3)
+                    .map(s => `> ${s.substring(0, 200)}...\n`)
+                    .join('\n');
+            }
+        }
+    
+        await this.app.vault.modify(file, content);
+        console.log("Note updated with semantic connections");
     }
 
     private async processNewNoteWithProgress(file: TFile, progress: ProgressNotice) {
@@ -461,6 +707,8 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
             const content = await this.app.vault.read(file);
             const youtubeLinks = this.extractYoutubeLinks(content);
     
+            this.currentFile = file;  // Set current file
+
             if (youtubeLinks.length === 0) return;
     
             for (const link of youtubeLinks) {
@@ -482,6 +730,8 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
         } catch (error) {
             console.error('Error processing note:', error);
             new Notice(`Error processing note: ${error.message}`);
+        } finally {
+            this.currentFile = null;  // Clear current file when done
         }
     }
 
@@ -633,5 +883,83 @@ class ProgressNotice {
         if (this.container && this.container.parentNode) {
             this.container.parentNode.removeChild(this.container);
         }
+    }
+}
+
+interface EmbeddingMetadata {
+    text: string;
+    embedding: number[];
+    filePath: string;
+    timestamp?: number;
+}
+
+// Add a new interface for results that include similarity
+interface SimilarityResult extends EmbeddingMetadata {
+    similarity: number;
+}
+
+
+interface VectorStore {
+    embeddings: EmbeddingMetadata[];
+    addEmbedding(metadata: EmbeddingMetadata): void;
+    findSimilar(embedding: number[], threshold: number): EmbeddingMetadata[];
+}
+
+class ObsidianVectorStore implements VectorStore {
+    embeddings: EmbeddingMetadata[] = [];
+    plugin: YoutubeKnowledgeGraphPlugin;
+
+    constructor(plugin: YoutubeKnowledgeGraphPlugin) {
+        this.plugin = plugin;
+        this.loadFromData();
+    }
+
+    addEmbedding(metadata: EmbeddingMetadata): void {
+        this.embeddings.push(metadata);
+        this.saveToData();
+    }
+
+    private async saveToData() {
+        try {
+            await this.plugin.saveData({
+                embeddings: this.embeddings
+            });
+        } catch (error) {
+            console.error('Failed to save vector store:', error);
+        }
+    }
+
+    private async loadFromData() {
+        try {
+            const data = await this.plugin.loadData();
+            if (data && data.embeddings) {
+                this.embeddings = data.embeddings;
+            }
+        } catch (error) {
+            console.error('Failed to load vector store:', error);
+            this.embeddings = [];
+        }
+    }
+
+    findSimilar(queryEmbedding: number[], threshold = 0.8): SimilarityResult[] {
+        return this.embeddings
+            .map(em => ({
+                ...em,
+                similarity: this.cosineSimilarity(queryEmbedding, em.embedding)
+            }))
+            .filter(em => em.similarity > threshold)
+            .sort((a, b) => b.similarity - a.similarity);
+    }
+
+    private cosineSimilarity(vec1: number[], vec2: number[]): number {
+        const dotProduct = vec1.reduce((sum, a, i) => sum + a * vec2[i], 0);
+        const mag1 = Math.sqrt(vec1.reduce((sum, a) => sum + a * a, 0));
+        const mag2 = Math.sqrt(vec2.reduce((sum, a) => sum + a * a, 0));
+        return dotProduct / (mag1 * mag2);
+    }
+
+    clearStore() {
+        this.embeddings = [];
+        this.saveToData();
     }
 }

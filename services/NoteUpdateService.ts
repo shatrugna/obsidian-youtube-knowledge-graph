@@ -9,11 +9,192 @@ export class NoteUpdateService {
         this.plugin = plugin;
     }
 
+    private async getConceptsForChunks(chunks: { text: string }[]): Promise<{ text: string, concepts: string[] }[]> {
+        // Limit batch size to avoid token limits
+        const BATCH_SIZE = 5;
+        const results: { text: string, concepts: string[] }[] = [];
+        
+        for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+            const batchChunks = chunks.slice(i, i + BATCH_SIZE);
+            console.log(`Processing batch ${i/BATCH_SIZE + 1}, chunks ${i} to ${i + batchChunks.length}`);
+    
+            try {
+                const batchResponse = await requestUrl({
+                    url: 'https://api.anthropic.com/v1/messages',
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': this.plugin.settings.anthropicApiKey,
+                        'anthropic-version': '2023-06-01'
+                    },
+                    body: JSON.stringify({
+                        model: "claude-3-opus-20240229",
+                        max_tokens: 1024,
+                        messages: [{
+                            role: "user",
+                            content: `Extract key concepts from each text segment.
+                            Return ONLY a JSON array. Do not include any explanatory text.
+                            Format must be exactly like this example, with different concepts:
+                            [
+                                {"concepts": ["Decision Making", "Risk Assessment"]},
+                                {"concepts": ["Strategic Planning", "Leadership"]}
+                            ]
+
+                            Text segments to analyze:
+                            ${batchChunks.map((chunk, idx) => 
+                                `SEGMENT ${idx + 1}:\n${chunk.text.substring(0, 500)}`
+                            ).join('\n\n')}`
+                        }]
+                    })
+                });
+    
+                if (batchResponse.status !== 200) {
+                    console.error("Batch response error:", batchResponse);
+                    throw new Error(`API returned status ${batchResponse.status}`);
+                }
+    
+                const parsedResponse = JSON.parse(batchResponse.text);
+                const conceptsData = JSON.parse(parsedResponse.content[0].text);
+                
+                // Map concepts back to original texts
+                batchChunks.forEach((chunk, idx) => {
+                    if (conceptsData[idx]) {
+                        results.push({
+                            text: chunk.text,
+                            concepts: conceptsData[idx].concepts
+                        });
+                    }
+                });
+    
+            } catch (error) {
+                console.error(`Error processing batch ${i/BATCH_SIZE + 1}:`, error);
+                // Add empty concepts for failed chunks to maintain alignment
+                batchChunks.forEach(chunk => {
+                    results.push({
+                        text: chunk.text,
+                        concepts: []
+                    });
+                });
+            }
+        }
+    
+        return results;
+    }
+
+    private async createConceptNote(concept: string): Promise<void> {
+        const conceptsFolder = 'Concepts';
+        const conceptFileName = `${conceptsFolder}/${concept}.md`;
+    
+        try {
+            // Create Concepts folder if it doesn't exist
+            if (!await this.plugin.app.vault.adapter.exists(conceptsFolder)) {
+                await this.plugin.app.vault.createFolder(conceptsFolder);
+            }
+    
+            // Create concept note if it doesn't exist
+            if (!await this.plugin.app.vault.adapter.exists(conceptFileName)) {
+                await this.plugin.app.vault.create(
+                    conceptFileName,
+                    `# ${concept}\n\nDiscussions exploring this concept:\n\n`
+                );
+            }
+        } catch (error) {
+            console.error(`Failed to create concept note for ${concept}:`, error);
+        }
+    }
+    
     async updateOriginalNote(file: TFile, metadata: YoutubeMetadata): Promise<void> {
         const chunks = await this.processTranscriptChunks(metadata.transcript, metadata.segments, file);
-        const connections = await this.findSemanticConnections(chunks, file);
-        await this.updateNoteContent(file, metadata, connections);
-        await this.updateConnectedNotes(file, connections);
+        
+        // Batch process concepts for all chunks
+        console.log("Getting concepts for all chunks...");
+        const chunksWithConcepts = await this.getConceptsForChunks(chunks);
+        console.log(`Processed ${chunksWithConcepts.length} chunks with concepts`);
+    
+        const connections = new Map<string, {
+            similarity: number,
+            snippets: { text: string, concepts: string[] }[],
+            concepts: Set<string>
+        }>();
+        
+        // Process semantic connections
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            const chunkConcepts = chunksWithConcepts[i].concepts;
+            
+            const similar = this.plugin.vectorStore.findSimilar(chunk.embedding, 0.8);
+            
+            for (const match of similar) {
+                if (match.filePath === file.path) continue;
+                
+                const existing = connections.get(match.filePath) || {
+                    similarity: 0,
+                    snippets: [],
+                    concepts: new Set<string>()
+                };
+                
+                existing.similarity = Math.max(existing.similarity, match.similarity);
+                existing.snippets.push({
+                    text: match.text,
+                    concepts: chunkConcepts
+                });
+                chunkConcepts.forEach(c => existing.concepts.add(c));
+                connections.set(match.filePath, existing);
+            }
+        }
+    
+        // Create concept notes only for concepts that have actual semantic connections
+        for (const connection of connections.values()) {
+            for (const concept of connection.concepts) {
+                await this.createConceptNote(concept);
+                const conceptFileName = `Concepts/${concept}.md`;
+                try {
+                    if (!await this.plugin.app.vault.adapter.exists(conceptFileName)) {
+                        await this.plugin.app.vault.create(
+                            conceptFileName,
+                            `# ${concept}\n\nDiscussions exploring this concept:\n\n`
+                        );
+                    }
+                    
+                    const conceptFile = this.plugin.app.vault.getAbstractFileByPath(conceptFileName);
+                    if (conceptFile instanceof TFile) {
+                        const conceptContent = await this.plugin.app.vault.read(conceptFile);
+                        if (!conceptContent.includes(file.basename)) {
+                            await this.plugin.app.vault.modify(
+                                conceptFile,
+                                `${conceptContent}- [[${file.basename}]]\n`
+                            );
+                        }
+                    }
+                } catch (error) {
+                    console.error(`Failed to manage concept note: ${error}`);
+                }
+            }
+        }
+    
+        // Update note content
+        let content = `# ${metadata.title}\n\n`;
+        content += `Video Link: https://www.youtube.com/watch?v=${metadata.videoId}\n`;
+        content += `[[.transcripts/Raw Transcript - ${file.basename}|View Full Transcript]]\n\n`;
+        content += `## Summary\n${metadata.summary}\n\n`;
+        
+        // Add semantic connections with specific concepts per snippet
+        content += `\n## Conceptually Related Discussions\n\n`;
+        for (const [path, data] of connections) {
+            const relatedFile = this.plugin.app.vault.getAbstractFileByPath(path);
+            if (relatedFile instanceof TFile) {
+                content += `### Connected to [[${relatedFile.basename}]]\n`;
+                content += `*Semantic Similarity: ${(data.similarity * 100).toFixed(1)}%*\n\n`;
+                
+                // Group snippets by shared concepts
+                for (const snippet of data.snippets) {
+                    content += `Through concepts: ${snippet.concepts.map(c => `[[Concepts/${c}|${c}]]`).join(', ')}\n`;
+                    content += `> "${snippet.text.substring(0, 200)}..."\n\n`;
+                }
+            }
+        }
+    
+        await this.plugin.app.vault.modify(file, content);
     }
 
     private async processTranscriptChunks(transcript: string, segments: WhisperTranscriptSegment[], file: TFile): Promise<EmbeddingMetadata[]> {

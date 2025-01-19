@@ -36,6 +36,7 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
       await this.loadSettings();
 
       this.vectorStore = new ObsidianVectorStore(this);
+      console.log("Vector store initialized");
 
       this.addRibbonIcon('youtube', 'Add YouTube Video', (evt: MouseEvent) => {
         console.log("YouTube icon clicked"); // Debug log
@@ -119,7 +120,18 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
         id: 'inspect-vectors',
         name: 'Debug: Inspect Vector Store',
         callback: () => {
-            console.log("Current embeddings in store:", this.vectorStore.embeddings.length);
+            console.log("Vector Store Debug Info:");
+            console.log("Store initialized:", this.vectorStore !== undefined);
+            console.log("Number of embeddings:", this.vectorStore.embeddings.length);
+            console.log("Files with embeddings:", new Set(this.vectorStore.embeddings.map(e => e.filePath)));
+            console.log("Sample embedding (if exists):", 
+                this.vectorStore.embeddings[0] ? {
+                    filePath: this.vectorStore.embeddings[0].filePath,
+                    textPreview: this.vectorStore.embeddings[0].text.substring(0, 100),
+                    embeddingLength: this.vectorStore.embeddings[0].embedding.length
+                } : "No embeddings"
+            );
+        
             console.log("Sample similarities between notes:");
             
             if (this.vectorStore.embeddings.length > 1) {
@@ -293,18 +305,30 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
 
     private async processTranscriptChunks(transcript: string, segments: WhisperTranscriptSegment[], file: TFile): Promise<EmbeddingMetadata[]> {
         const chunks = this.createChunks(segments, 1000);
+        console.log(`Created ${chunks.length} chunks from transcript`);
     
         const embeddings: EmbeddingMetadata[] = [];
         for (const chunk of chunks) {
-            const embedding = await this.getEmbedding(chunk.text);
-            embeddings.push({
-                text: chunk.text,
-                embedding: embedding,
-                filePath: file.path,
-                timestamp: chunk.startTime
-            });
+            try {
+                console.log("Getting embedding for chunk:", chunk.text.substring(0, 100));
+                const embedding = await this.getEmbedding(chunk.text);
+                const metadata: EmbeddingMetadata = {
+                    text: chunk.text,
+                    embedding: embedding,
+                    filePath: file.path,
+                    timestamp: chunk.startTime
+                };
+                
+                // Add to vector store
+                console.log("Adding chunk embedding to vector store");
+                this.vectorStore.addEmbedding(metadata);
+                embeddings.push(metadata);
+            } catch (error) {
+                console.error("Error processing chunk:", error);
+            }
         }
     
+        console.log(`Processed ${embeddings.length} chunks successfully`);
         return embeddings;
     }
 
@@ -623,22 +647,15 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
     }
 
     private async updateOriginalNote(file: TFile, metadata: YoutubeMetadata) {
-        console.log("Processing chunks for semantic matching...");
         const chunks = await this.processTranscriptChunks(metadata.transcript, metadata.segments, file);
-        console.log(`Generated ${chunks.length} chunks`);
-    
+
+        // Find semantic connections
         const connections = new Map<string, {similarity: number, snippets: string[]}>();
         
-        console.log("Finding semantic connections...");
         for (const chunk of chunks) {
             const similar = this.vectorStore.findSimilar(chunk.embedding, 0.8);
-            console.log(`Found ${similar.length} similar chunks for current segment`);
-            
             for (const match of similar) {
                 if (match.filePath === file.path) continue;
-                
-                console.log(`Match found in ${match.filePath} with similarity ${match.similarity}`);
-                console.log(`Matching text: "${match.text.substring(0, 100)}..."`);
                 
                 const existing = connections.get(match.filePath) || {
                     similarity: 0,
@@ -646,31 +663,64 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
                 };
                 
                 existing.similarity = Math.max(existing.similarity, match.similarity);
-                existing.snippets.push(match.text);
+                if (!existing.snippets.includes(match.text)) {
+                    existing.snippets.push(match.text);
+                }
                 connections.set(match.filePath, existing);
             }
         }
     
-        console.log(`Found connections to ${connections.size} other notes`);
+        // Update current note with new format
+        let content = `# ${metadata.title}\n\n`;
+        content += `Video Link: ${metadata.videoId ? `https://www.youtube.com/watch?v=${metadata.videoId}` : ''}\n\n`;
+        content += `[[.transcripts/Raw Transcript - ${file.basename}|View Full Transcript]]\n\n`;  // Added this line
+
+        // Add summary section
+        content += `## Summary\n${metadata.summary}\n\n`;
         
-        // Update note with connections
-        let content = await this.app.vault.read(file);
-        content += '\n\n## Related Content\n';
-        
-        for (const [path, data] of connections) {
-            const relatedFile = this.app.vault.getAbstractFileByPath(path);
-            if (relatedFile instanceof TFile) {
-                console.log(`Adding connection to ${relatedFile.basename} (${data.similarity})`);
-                content += `\n### [[${relatedFile.basename}]] (${(data.similarity * 100).toFixed(1)}% similar)\n`;
-                content += data.snippets
-                    .slice(0, 3)
-                    .map(s => `> ${s.substring(0, 200)}...\n`)
-                    .join('\n');
+        // Add semantic connections with better formatting
+        if (connections.size > 0) {
+            content += `## Conceptually Related Discussions\n\n`;
+            
+            for (const [path, data] of connections) {
+                const relatedFile = this.app.vault.getAbstractFileByPath(path);
+                if (relatedFile instanceof TFile) {
+                    content += `### Connected to [[${relatedFile.basename}]]\n`;
+                    content += `*Semantic Similarity: ${(data.similarity * 100).toFixed(1)}%*\n\n`;
+                    
+                    // Add relevant quotes, cleaned up and formatted
+                    const quotes = data.snippets
+                        .slice(0, 2) // Limit to 2 most relevant quotes
+                        .map(s => s.trim())
+                        .map(s => `> "${s.substring(0, 200)}${s.length > 200 ? '...' : ''}"`)
+                        .join('\n\n');
+                    
+                    content += `${quotes}\n\n`;
+                }
             }
         }
     
         await this.app.vault.modify(file, content);
-        console.log("Note updated with semantic connections");
+    
+        // Update connected notes with backlinks
+        for (const [path, data] of connections) {
+            const relatedFile = this.app.vault.getAbstractFileByPath(path);
+            if (relatedFile instanceof TFile) {
+                try {
+                    let relatedContent = await this.app.vault.read(relatedFile);
+                    if (!relatedContent.includes(`[[${file.basename}]]`)) {
+                        if (!relatedContent.includes('## Conceptually Related Discussions')) {
+                            relatedContent += '\n\n## Conceptually Related Discussions\n';
+                        }
+                        relatedContent += `\n### Connected to [[${file.basename}]]\n`;
+                        relatedContent += `*Semantic Similarity: ${(data.similarity * 100).toFixed(1)}%*\n\n`;
+                        await this.app.vault.modify(relatedFile, relatedContent);
+                    }
+                } catch (error) {
+                    console.error(`Failed to update related note ${relatedFile.basename}:`, error);
+                }
+            }
+        }
     }
 
     private async processNewNoteWithProgress(file: TFile, progress: ProgressNotice) {
@@ -915,8 +965,14 @@ class ObsidianVectorStore implements VectorStore {
     }
 
     addEmbedding(metadata: EmbeddingMetadata): void {
+        console.log("Adding new embedding to store:", {
+            text: metadata.text.substring(0, 100),
+            filePath: metadata.filePath,
+            embeddingSize: metadata.embedding.length
+        });
         this.embeddings.push(metadata);
         this.saveToData();
+        console.log("Current store size:", this.embeddings.length);
     }
 
     private async saveToData() {

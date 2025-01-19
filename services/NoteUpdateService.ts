@@ -175,7 +175,7 @@ export class NoteUpdateService {
         // Update note content
         let content = `# ${metadata.title}\n\n`;
         content += `Video Link: https://www.youtube.com/watch?v=${metadata.videoId}\n`;
-        content += `[[.transcripts/Raw Transcript - ${file.basename}|View Full Transcript]]\n\n`;
+        content += `[[Transcripts/Transcript - ${file.basename}|View Full Transcript]]\n\n`;  // Updated path
         content += `## Summary\n${metadata.summary}\n\n`;
         
         // Add semantic connections with specific concepts per snippet

@@ -1,15 +1,16 @@
 # YouTube Knowledge Graph for Obsidian
 
-A plugin for Obsidian that creates a semantically connected knowledge graph from YouTube video content. It automatically extracts video transcripts, generates summaries through Claude, and builds connections between related discussions using semantic similarity.
+A plugin for Obsidian that creates a semantically connected knowledge graph from YouTube video content. It automatically extracts video transcripts, generates summaries through Claude, and builds connections between related discussions using semantic similarity and conceptual linking.
 
 ## Features
 
-- Automatically transcribes YouTube videos from links using local Whisper server
-- Generates concise summaries of video content using Claude
+- Easily add YouTube videos through ribbon icon or command palette
+- Automatically transcribes videos using local Whisper server
+- Generates concise summaries using Claude
 - Creates semantic connections between related discussions using embeddings
-- Integrates with Obsidian's native graph visualization
-- Stores raw transcripts in a hidden folder for reference
-- Builds a knowledge network based on content similarity rather than just manual links
+- Extracts and links key concepts across videos
+- Stores organized transcripts for reference
+- Builds a rich knowledge network based on content similarity and shared concepts
 
 ## Prerequisites
 
@@ -51,21 +52,19 @@ python whisper_server.py
 ## Usage
 
 1. Click the YouTube icon in the ribbon (left sidebar) or use command palette (Cmd/Ctrl + P) to open "Add YouTube Video"
-
 2. Paste a YouTube video URL in the modal
-
 3. The plugin will automatically:
    - Create a new note with the video title
    - Extract and transcribe the video using Whisper
    - Generate a summary using Claude
-   - Create embeddings for semantic analysis
+   - Extract key concepts from the content
    - Find and link to conceptually related discussions
-   - Store raw transcript in `.transcripts` folder for reference
-
+   - Store transcript in the Transcripts folder
 4. View connections:
-   - Open Obsidian's graph view to see semantic connections
+   - Open Obsidian's graph view to see semantic and conceptual connections
    - Check "Conceptually Related Discussions" section in notes
-   - Click through to related content based on similarity scores
+   - Click through to related content based on shared concepts and similarity scores
+   - Browse concepts to explore related discussions
 
 ## Note Structure
 
@@ -74,6 +73,7 @@ Each processed note will have:
 - Link to full transcript
 - Generated summary
 - Semantic connections to related discussions with:
+  - Shared concepts
   - Similarity scores
   - Relevant quotes showing the connection
   - Bi-directional links for graph visualization
@@ -105,6 +105,7 @@ npm run build
 - Add progress indicators for long transcriptions
 - Support for different YouTube URL formats
 - Improve similarity threshold tuning
+- Add concept relationship visualization
 
 ## Support
 

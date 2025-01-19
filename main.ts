@@ -125,7 +125,7 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
                 if (!videoId) continue;
 
                 const metadata = await this.youtubeProcessor.processVideo(videoId);
-                await this.transcriptService.createTranscriptNote(file, videoId, metadata.transcript);
+                await this.transcriptService.createTranscriptNote(file, metadata);
                 await this.noteUpdateService.updateOriginalNote(file, metadata);
             }
         } catch (error) {
@@ -153,7 +153,7 @@ export default class YoutubeKnowledgeGraphPlugin extends Plugin {
                 
                 progress.setProgress(70);
                 progress.setMessage('Creating transcript note');
-                await this.transcriptService.createTranscriptNote(file, videoId, metadata.transcript);
+                await this.transcriptService.createTranscriptNote(file, metadata);
                 
                 progress.setProgress(90);
                 progress.setMessage('Updating notes with analysis');

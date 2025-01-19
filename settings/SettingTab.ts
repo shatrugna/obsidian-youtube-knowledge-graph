@@ -1,13 +1,6 @@
 import { App, PluginSettingTab, Setting } from 'obsidian';
-import YoutubeKnowledgeGraphPlugin from './main';
-
-export interface PluginSettings {
-    anthropicApiKey: string;  // Changed from openaiApiKey
-}
-
-export const DEFAULT_SETTINGS: PluginSettings = {
-    anthropicApiKey: ''
-}
+import type YoutubeKnowledgeGraphPlugin from '../main';
+import { DEFAULT_SETTINGS } from './settings';
 
 export class SettingTab extends PluginSettingTab {
     plugin: YoutubeKnowledgeGraphPlugin;
@@ -18,16 +11,16 @@ export class SettingTab extends PluginSettingTab {
     }
 
     display(): void {
-        const { containerEl } = this;
+        const {containerEl} = this;
         containerEl.empty();
 
-        containerEl.createEl('h2', { text: 'YouTube Knowledge Graph Settings' });
+        containerEl.createEl('h2', {text: 'YouTube Knowledge Graph Settings'});
 
         new Setting(containerEl)
             .setName('Anthropic API Key')
-            .setDesc('Enter your Anthropic API key')
+            .setDesc('Enter your Anthropic API key for text analysis')
             .addText(text => text
-                .setPlaceholder('Enter your key')
+                .setPlaceholder('Enter your API key')
                 .setValue(this.plugin.settings.anthropicApiKey)
                 .onChange(async (value) => {
                     this.plugin.settings.anthropicApiKey = value;
